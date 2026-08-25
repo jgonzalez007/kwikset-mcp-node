@@ -1,0 +1,23 @@
+{
+  "name": "kwikset-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for managing Kwikset Halo / Halo Touch / Halo Select smart locks",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "kwikset-mcp": "src/server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "login": "node auth-setup.js"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.5.0",
+    "amazon-cognito-identity-js": "^6.3.6",
+    "zod": "^3.23.8"
+  }
+}

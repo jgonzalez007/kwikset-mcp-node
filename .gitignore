@@ -1,0 +1,6 @@
+node_modules/
+npm-debug.log*
+
+# Kwikset session tokens - never commit these
+.kwikset-mcp/
+*.tokens.json
