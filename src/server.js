@@ -11,7 +11,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { KwiksetClient, KwiksetAuthError, NotFoundError } from "./kwikset-client.js";
+import {
+  KwiksetClient,
+  KwiksetAuthError,
+  NotFoundError,
+  ValidationError,
+} from "./kwikset-client.js";
 
 const server = new McpServer({
   name: "kwikset",
@@ -29,6 +34,9 @@ async function withClient(fn) {
     }
     if (err instanceof NotFoundError) {
       return { error: "not_found", message: err.message };
+    }
+    if (err instanceof ValidationError) {
+      return { error: "validation_error", message: err.message };
     }
     return { error: "kwikset_api_error", message: String(err.message || err) };
   }
@@ -98,6 +106,114 @@ server.tool(
     "field this server looks for, and this shows the real field names.",
   {},
   async () => toResult(await withClient((c) => c.debugRawDevices()))
+);
+
+// ---------------------------------------------------------------------
+// Access code tools - built against REAL Kwikset endpoints and wire
+// format (confirmed by decompiling the real Android app; see the
+// "Known limitations" comment above the access-code section of
+// kwikset-client.js). Known gaps vs. the real app, all documented there:
+// no live "list codes" read (local tracking only), no schedules (v1 is
+// always-allowed codes only), and no edit (remove + re-add instead).
+// ---------------------------------------------------------------------
+
+server.tool(
+  "list_access_codes",
+  "List the keypad access codes THIS SERVER has created on a lock. " +
+    "Kwikset's API has no endpoint to read codes back from the lock " +
+    "itself, so this only shows codes added/removed through this server " +
+    "- it will NOT show codes added via the Kwikset app or the keypad. " +
+    "Get device_id from list_locks first.",
+  { device_id: z.string().describe("A lock's device_id, from list_locks") },
+  async ({ device_id }) =>
+    toResult(await withClient((c) => c.listAccessCodes(device_id)))
+);
+
+server.tool(
+  "add_access_code",
+  "Add a keypad access code to a lock. v1 only supports permanent, " +
+    "always-allowed codes (no date ranges or schedules yet). This " +
+    "creates a real, working entry credential on a physical door - only " +
+    "call this after the user has explicitly asked for a code to be " +
+    "added, and pass confirm=true. Calling with confirm=false (the " +
+    "default) is a no-op. Slot allocation is tracked locally by this " +
+    "server and can collide with a slot already used by a code set " +
+    "outside it (the Kwikset app, the keypad) - check the app for " +
+    "existing codes first, or pass an explicit slot.",
+  {
+    device_id: z.string().describe("A lock's device_id, from list_locks"),
+    name: z.string().describe("A label for this code, e.g. 'Dog walker'"),
+    code: z
+      .string()
+      .describe("The numeric PIN to add, as a string, 4-8 digits (e.g. '482913')"),
+    slot: z
+      .number()
+      .int()
+      .min(0)
+      .max(255)
+      .optional()
+      .describe(
+        "Specific slot/index to use instead of automatic allocation. " +
+          "Omit to let this server pick the lowest slot it isn't already " +
+          "tracking for this device."
+      ),
+    confirm: z
+      .boolean()
+      .default(false)
+      .describe("Must be true to actually add the code."),
+  },
+  async ({ device_id, name, code, slot, confirm }) => {
+    if (!confirm) {
+      return toResult({
+        error: "confirmation_required",
+        message:
+          "Pass confirm=true to actually add this code. This guard exists " +
+          "so a new entry credential is only created on an explicit, " +
+          "unambiguous user request.",
+      });
+    }
+    return toResult(await withClient((c) => c.addAccessCode(device_id, { name, code, slot })));
+  }
+);
+
+server.tool(
+  "remove_access_code",
+  "Remove a keypad access code from a lock. Get slot from " +
+    "list_access_codes first (only codes this server created are known " +
+    "- see list_access_codes). This revokes a real entry credential - " +
+    "only call this after an explicit user request, and pass confirm=true.",
+  {
+    device_id: z.string().describe("A lock's device_id, from list_locks"),
+    slot: z.number().int().min(0).max(255).describe("A code's slot, from list_access_codes"),
+    confirm: z
+      .boolean()
+      .default(false)
+      .describe("Must be true to actually remove the code."),
+  },
+  async ({ device_id, slot, confirm }) => {
+    if (!confirm) {
+      return toResult({
+        error: "confirmation_required",
+        message:
+          "Pass confirm=true to actually remove this code. This guard " +
+          "exists so an entry credential is only revoked on an explicit, " +
+          "unambiguous user request.",
+      });
+    }
+    return toResult(await withClient((c) => c.removeAccessCode(device_id, slot)));
+  }
+);
+
+server.tool(
+  "debug_raw_access_codes",
+  "Diagnostic tool: dumps the raw response from Kwikset's real " +
+    "CRC/checksum manifest endpoint (getOverallAccessCodeCrc). This is " +
+    "NOT a way to see code contents - Kwikset's API genuinely has no such " +
+    "endpoint - it's a sync-verification manifest only. Use " +
+    "list_access_codes for the codes this server has actually set.",
+  { device_id: z.string().describe("A lock's device_id, from list_locks") },
+  async ({ device_id }) =>
+    toResult(await withClient((c) => c.debugRawAccessCodes(device_id)))
 );
 
 const transport = new StdioServerTransport();

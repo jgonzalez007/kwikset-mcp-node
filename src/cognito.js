@@ -23,11 +23,17 @@ import {
   COGNITO_USER_POOL_ID,
   COGNITO_USER_POOL_CLIENT_ID,
 } from "./const.js";
+import { withTimeout } from "./util.js";
 
 const userPool = new CognitoUserPool({
   UserPoolId: COGNITO_USER_POOL_ID,
   ClientId: COGNITO_USER_POOL_CLIENT_ID,
 });
+
+// Cognito calls are network requests with no built-in timeout in
+// amazon-cognito-identity-js. A stuck request (bad network, Cognito
+// unreachable) would otherwise hang forever instead of failing loudly.
+const NETWORK_TIMEOUT_MS = 20_000;
 
 function sessionToTokens(session) {
   return {
@@ -116,7 +122,7 @@ export function refresh(email, refreshToken) {
   const cognitoUser = new CognitoUser({ Username: email, Pool: userPool });
   const token = new CognitoRefreshToken({ RefreshToken: refreshToken });
 
-  return new Promise((resolve, reject) => {
+  const promise = new Promise((resolve, reject) => {
     cognitoUser.refreshSession(token, (err, session) => {
       if (err) {
         reject(err);
@@ -125,4 +131,10 @@ export function refresh(email, refreshToken) {
       resolve({ email, ...sessionToTokens(session) });
     });
   });
+
+  // This runs on every tool call with no user interaction involved, so a
+  // stuck network request should fail fast rather than hang - unlike
+  // login() below, which waits on a human typing an MFA code and shouldn't
+  // be raced against a short timer.
+  return withTimeout(promise, NETWORK_TIMEOUT_MS, "Cognito token refresh");
 }

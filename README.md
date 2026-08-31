@@ -31,6 +31,15 @@ if it fails outright (not just one field showing `null`), the pool/host
 constants may be stale; if a tool returns nulls, run `debug_raw_devices`
 to see the real field names and compare against `src/kwikset-client.js`.
 
+If a tool call hangs and the MCP host eventually reports a generic
+"timed out after 60s," that's the host's own outer timeout, not this
+server's — every network call here (Cognito refresh, every REST request)
+now has its own shorter internal timeout (15-20s) that fails with a
+specific, readable error instead. If you see the generic 60s timeout
+anyway, something below that layer is stuck (e.g. no network route to
+AWS/Kwikset from this machine) — check that `node auth-setup.js` can
+reach the internet at all.
+
 ## Why login is a separate step
 
 Your Kwikset password should never pass through an LLM conversation. So
@@ -139,6 +148,53 @@ password.
 | `lock_door(device_id)` | Lock a door |
 | `unlock_door(device_id, confirm)` | Unlock a door (`confirm=true` required) |
 | `debug_raw_devices` | Diagnostic: raw, unprocessed home/device JSON from Kwikset's API |
+| `list_access_codes(device_id)` | Codes this server has created — see below |
+| `add_access_code(device_id, name, code, slot?, confirm)` | Add a code — see below |
+| `remove_access_code(device_id, slot, confirm)` | Remove a code — see below |
+| `debug_raw_access_codes(device_id)` | Diagnostic: raw CRC/checksum manifest from Kwikset's API |
+
+### Access-code tools: real endpoints, with known v1 limitations
+
+Unlike the guessed `usercodes` endpoint this project started with (which
+returned a 403 against a real account), `add_access_code`/
+`remove_access_code`/`list_access_codes` now talk to Kwikset's **real**
+access-code endpoints — `POST`/`PATCH`/`DELETE prod_v1/devices/{id}/accesscode`
+— using the **real wire format**, both confirmed by decompiling the actual
+Kwikset Android app (`com.kwikset.blewifi`) with jadx. The request body is
+`{"message": "<Base64>"}`, where the Base64 decodes to a small TLV8
+(Type-Length-Value) binary record — not JSON — packing the slot index, an
+enabled flag, and the code's digits as packed BCD. No encryption or device
+pairing is involved anywhere in this flow. See `src/tlv8.js` and
+`src/access-code-codec.js` for the byte-level implementation, and the
+"DoorLock" project notes for the full reverse-engineering trace.
+
+That said, this is a v1 with real, documented gaps versus the official
+app — not guesses, but genuine capability limits of this implementation:
+
+- **No live "list codes" read.** Kwikset's API has no endpoint to read
+  codes back off a lock — only CRC/checksum manifests meant for the lock
+  itself to verify sync, not for an app to read code contents. The real
+  Kwikset app instead relies on a local on-device cache built from
+  background Bluetooth/cloud sync, which this server doesn't have. So
+  `list_access_codes` only shows codes **this server has created** — it
+  won't reflect codes added via the Kwikset app or the keypad, and if you
+  add/remove a code some other way, this server's record goes stale.
+- **No schedules.** v1 only supports permanent, always-allowed codes — no
+  date ranges or weekly schedules. Real schedule serialization was never
+  reverse-engineered.
+- **No edit.** The real edit/modify request was never reverse-engineered.
+  Remove the old code and add a new one instead.
+- **Slot collisions are possible.** Because there's no live read, slot
+  numbers are tracked locally starting from 1, with no visibility into
+  slots already used by codes set outside this server. Check the Kwikset
+  app for existing codes before adding one here, or pass an explicit
+  `slot`.
+
+Concretely: treat your first `add_access_code` call as the real test —
+**verify the result in the Kwikset app or at the keypad afterward.** If
+it fails outright, `debug_raw_access_codes` shows the raw manifest
+response, and the tool's own `raw_response`/`sync_status` fields show
+exactly what Kwikset's API returned for the create/delete call itself.
 
 ## Re-authenticating
 
@@ -152,11 +208,15 @@ error with instructions — just re-run `node auth-setup.js`.
 kwikset-mcp/
 ├── auth-setup.js           # run once, by hand, to log in
 ├── src/
-│   ├── const.js             # Cognito pool/client IDs, API host (see caveats above)
-│   ├── auth.js               # local token file read/write
-│   ├── cognito.js            # AWS Cognito login/refresh (amazon-cognito-identity-js)
-│   ├── kwikset-client.js     # REST calls: homes, devices, lock/unlock
-│   └── server.js             # MCP server + tool definitions
+│   ├── const.js               # Cognito pool/client IDs, API host (see caveats above)
+│   ├── auth.js                # local token file read/write
+│   ├── cognito.js             # AWS Cognito login/refresh (amazon-cognito-identity-js)
+│   ├── util.js                # shared request-timeout helper
+│   ├── tlv8.js                # TLV8 record encoding + type-byte enums (reverse-engineered)
+│   ├── access-code-codec.js   # builds the real create/delete access-code byte payloads
+│   ├── access-code-store.js   # local record of codes this server has set (~/.kwikset-mcp/access-codes.json)
+│   ├── kwikset-client.js      # REST calls: homes, devices, lock/unlock, access codes
+│   └── server.js              # MCP server + tool definitions
 ├── package.json
 └── .gitignore
 ```
