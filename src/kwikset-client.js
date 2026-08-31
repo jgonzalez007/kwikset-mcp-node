@@ -118,7 +118,7 @@ export class KwiksetClient {
       device_id: first(device, "deviceid", "deviceId", "id"),
       name: first(device, "devicename", "deviceName", "name"),
       home: home ? first(home, "homename", "homeName", "name") : null,
-      status: first(device, "doorstatus", "status", "state"),
+      status: first(device, "lockstatus", "doorstatus", "status", "state"),
       battery_percent: first(device, "batterypercentage", "battery", "batteryPercentage"),
       model: first(device, "modelnumber", "modelNumber", "model"),
       serial_number: first(device, "serialnumber", "serialNumber"),
