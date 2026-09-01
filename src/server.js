@@ -112,9 +112,10 @@ server.tool(
 // Access code tools - built against REAL Kwikset endpoints and wire
 // format (confirmed by decompiling the real Android app; see the
 // "Known limitations" comment above the access-code section of
-// kwikset-client.js). Known gaps vs. the real app, all documented there:
-// no live "list codes" read (local tracking only), no schedules (v1 is
-// always-allowed codes only), and no edit (remove + re-add instead).
+// kwikset-client.js and the comments in access-code-codec.js for the
+// Schedule byte format). Known gaps vs. the real app, all documented
+// there: no live "list codes" read (local tracking only), and no edit
+// (remove + re-add instead).
 // ---------------------------------------------------------------------
 
 server.tool(
@@ -129,17 +130,65 @@ server.tool(
     toResult(await withClient((c) => c.listAccessCodes(device_id)))
 );
 
+const timeOfDayShape = {
+  hour: z.number().int().min(0).max(23).describe("24-hour local hour, 0-23"),
+  minute: z.number().int().min(0).max(59).describe("Local minute, 0-59"),
+};
+
+const scheduleSchema = z
+  .discriminatedUnion("type", [
+    z.object({
+      type: z.literal("date_range"),
+      start: z
+        .object({
+          year: z.number().int().min(2000).max(2127),
+          month: z.number().int().min(1).max(12),
+          day: z.number().int().min(1).max(31),
+          ...timeOfDayShape,
+        })
+        .describe("Local date/time the code starts working."),
+      end: z
+        .object({
+          year: z.number().int().min(2000).max(2127),
+          month: z.number().int().min(1).max(12),
+          day: z.number().int().min(1).max(31),
+          ...timeOfDayShape,
+        })
+        .describe("Local date/time the code stops working."),
+    }),
+    z.object({
+      type: z.literal("weekly"),
+      start: z.object(timeOfDayShape).describe("Local time-of-day the code starts working."),
+      end: z.object(timeOfDayShape).describe("Local time-of-day the code stops working."),
+      days: z
+        .object({
+          sunday: z.boolean().optional(),
+          monday: z.boolean().optional(),
+          tuesday: z.boolean().optional(),
+          wednesday: z.boolean().optional(),
+          thursday: z.boolean().optional(),
+          friday: z.boolean().optional(),
+          saturday: z.boolean().optional(),
+        })
+        .describe("Which days of the week the schedule applies to."),
+    }),
+  ])
+  .describe(
+    "Optional. Omit for a permanent, always-allowed code. All date/time " +
+      "fields are local wall-clock time (the lock's own timezone), not UTC " +
+      "or epoch time."
+  );
+
 server.tool(
   "add_access_code",
-  "Add a keypad access code to a lock. v1 only supports permanent, " +
-    "always-allowed codes (no date ranges or schedules yet). This " +
-    "creates a real, working entry credential on a physical door - only " +
-    "call this after the user has explicitly asked for a code to be " +
-    "added, and pass confirm=true. Calling with confirm=false (the " +
-    "default) is a no-op. Slot allocation is tracked locally by this " +
-    "server and can collide with a slot already used by a code set " +
-    "outside it (the Kwikset app, the keypad) - check the app for " +
-    "existing codes first, or pass an explicit slot.",
+  "Add a keypad access code to a lock, either permanent or restricted to " +
+    "a date range or weekly schedule. This creates a real, working entry " +
+    "credential on a physical door - only call this after the user has " +
+    "explicitly asked for a code to be added, and pass confirm=true. " +
+    "Calling with confirm=false (the default) is a no-op. Slot allocation " +
+    "is tracked locally by this server and can collide with a slot " +
+    "already used by a code set outside it (the Kwikset app, the keypad) " +
+    "- check the app for existing codes first, or pass an explicit slot.",
   {
     device_id: z.string().describe("A lock's device_id, from list_locks"),
     name: z.string().describe("A label for this code, e.g. 'Dog walker'"),
@@ -157,12 +206,13 @@ server.tool(
           "Omit to let this server pick the lowest slot it isn't already " +
           "tracking for this device."
       ),
+    schedule: scheduleSchema.optional(),
     confirm: z
       .boolean()
       .default(false)
       .describe("Must be true to actually add the code."),
   },
-  async ({ device_id, name, code, slot, confirm }) => {
+  async ({ device_id, name, code, slot, schedule, confirm }) => {
     if (!confirm) {
       return toResult({
         error: "confirmation_required",
@@ -172,7 +222,9 @@ server.tool(
           "unambiguous user request.",
       });
     }
-    return toResult(await withClient((c) => c.addAccessCode(device_id, { name, code, slot })));
+    return toResult(
+      await withClient((c) => c.addAccessCode(device_id, { name, code, slot, schedule }))
+    );
   }
 );
 

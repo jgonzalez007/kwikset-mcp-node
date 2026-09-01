@@ -179,16 +179,20 @@ app — not guesses, but genuine capability limits of this implementation:
   `list_access_codes` only shows codes **this server has created** — it
   won't reflect codes added via the Kwikset app or the keypad, and if you
   add/remove a code some other way, this server's record goes stale.
-- **No schedules.** v1 only supports permanent, always-allowed codes — no
-  date ranges or weekly schedules. Real schedule serialization was never
-  reverse-engineered.
+- **Schedules supported.** `add_access_code` accepts an optional
+  `schedule` (permanent, `date_range`, or `weekly`) — the real Schedule
+  TLV8 byte format, reverse-engineered from the decompiled app. All
+  date/time fields are local wall-clock time, not UTC/epoch.
 - **No edit.** The real edit/modify request was never reverse-engineered.
   Remove the old code and add a new one instead.
 - **Slot collisions are possible.** Because there's no live read, slot
-  numbers are tracked locally starting from 1, with no visibility into
-  slots already used by codes set outside this server. Check the Kwikset
-  app for existing codes before adding one here, or pass an explicit
-  `slot`.
+  numbers are tracked locally, with no visibility into slots already used
+  by codes set outside this server. **Confirmed on real hardware:** a
+  manufacturer/factory-default code occupies one of the low slot numbers
+  - colliding with it silently fails (or is rejected by the Kwikset app)
+  even though the create request itself returns success. Automatic
+  allocation now starts at slot 10 to avoid this; check the Kwikset app
+  for existing codes before adding one here, or pass an explicit `slot`.
 
 Concretely: treat your first `add_access_code` call as the real test —
 **verify the result in the Kwikset app or at the keypad afterward.** If

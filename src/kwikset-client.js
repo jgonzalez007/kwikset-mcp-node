@@ -9,6 +9,9 @@ import { loadTokens, saveTokens } from "./auth.js";
 import {
   buildCreateAccessCodePayload,
   buildDeleteAccessCodePayload,
+  buildDateRangeScheduleBytes,
+  buildWeeklyScheduleBytes,
+  DeviceAccessScheduleType,
 } from "./access-code-codec.js";
 import * as codeStore from "./access-code-store.js";
 
@@ -289,14 +292,86 @@ export class KwiksetClient {
       name: entry.name,
       code: entry.code,
       enabled: entry.enabled,
+      schedule: entry.schedule || null,
       created_at: entry.createdAt,
     }));
   }
 
-  /** Add a keypad access code. v1: always-allowed only (no schedule) -
-   * see the "Known limitations" comment above this section. Pass `slot`
-   * to target a specific index instead of automatic allocation. */
-  async addAccessCode(deviceId, { name, code, slot } = {}) {
+  static #validateTimeOfDay({ hour, minute } = {}, label) {
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
+      throw new ValidationError(`${label}.hour must be an integer 0-23, got ${JSON.stringify(hour)}`);
+    }
+    if (!Number.isInteger(minute) || minute < 0 || minute > 59) {
+      throw new ValidationError(`${label}.minute must be an integer 0-59, got ${JSON.stringify(minute)}`);
+    }
+  }
+
+  static #validateScheduleDate({ year, month, day } = {}, label) {
+    if (!Number.isInteger(year) || year < 2000 || year > 2127) {
+      throw new ValidationError(`${label}.year must be an integer 2000-2127, got ${JSON.stringify(year)}`);
+    }
+    if (!Number.isInteger(month) || month < 1 || month > 12) {
+      throw new ValidationError(`${label}.month must be an integer 1-12, got ${JSON.stringify(month)}`);
+    }
+    if (!Number.isInteger(day) || day < 1 || day > 31) {
+      throw new ValidationError(`${label}.day must be an integer 1-31, got ${JSON.stringify(day)}`);
+    }
+  }
+
+  /** Validates and byte-packs an optional schedule into a
+   * {scheduleType, scheduleBytes} pair for buildCreateAccessCodePayload.
+   * Omit `schedule` for a permanent, always-allowed code. */
+  static #resolveSchedule(schedule) {
+    if (!schedule) {
+      return { scheduleType: DeviceAccessScheduleType.AllDay, scheduleBytes: Buffer.alloc(0) };
+    }
+    if (schedule.type === "date_range") {
+      KwiksetClient.#validateScheduleDate(schedule.start, "schedule.start");
+      KwiksetClient.#validateTimeOfDay(schedule.start, "schedule.start");
+      KwiksetClient.#validateScheduleDate(schedule.end, "schedule.end");
+      KwiksetClient.#validateTimeOfDay(schedule.end, "schedule.end");
+      const startMs = Date.UTC(
+        schedule.start.year, schedule.start.month - 1, schedule.start.day,
+        schedule.start.hour, schedule.start.minute
+      );
+      const endMs = Date.UTC(
+        schedule.end.year, schedule.end.month - 1, schedule.end.day,
+        schedule.end.hour, schedule.end.minute
+      );
+      if (!(startMs < endMs)) {
+        throw new ValidationError("schedule.start must be before schedule.end.");
+      }
+      return {
+        scheduleType: DeviceAccessScheduleType.DateRange,
+        scheduleBytes: buildDateRangeScheduleBytes({ start: schedule.start, end: schedule.end }),
+      };
+    }
+    if (schedule.type === "weekly") {
+      KwiksetClient.#validateTimeOfDay(schedule.start, "schedule.start");
+      KwiksetClient.#validateTimeOfDay(schedule.end, "schedule.end");
+      if (!schedule.days || !Object.values(schedule.days).some(Boolean)) {
+        throw new ValidationError("schedule.days must have at least one day enabled.");
+      }
+      return {
+        scheduleType: DeviceAccessScheduleType.Weekly,
+        scheduleBytes: buildWeeklyScheduleBytes({
+          start: schedule.start,
+          end: schedule.end,
+          days: schedule.days,
+        }),
+      };
+    }
+    throw new ValidationError(
+      `schedule.type must be "date_range" or "weekly", got ${JSON.stringify(schedule.type)}`
+    );
+  }
+
+  /** Add a keypad access code. Omit `schedule` for a permanent,
+   * always-allowed code, or pass a date_range/weekly schedule (see
+   * #resolveSchedule) - both confirmed from decompiling the real app's
+   * Schedule TLV8 byte format. Pass `slot` to target a specific index
+   * instead of automatic allocation. */
+  async addAccessCode(deviceId, { name, code, slot, schedule } = {}) {
     if (!name || !String(name).trim()) {
       throw new ValidationError("name is required.");
     }
@@ -308,11 +383,15 @@ export class KwiksetClient {
       throw new ValidationError(`slot must be an integer 0-255, got ${JSON.stringify(slot)}`);
     }
 
+    const { scheduleType, scheduleBytes } = KwiksetClient.#resolveSchedule(schedule);
+
     const payload = buildCreateAccessCodePayload({
       index,
       friendlyName: name,
       enabled: true,
       code,
+      scheduleType,
+      scheduleBytes,
     });
     const { raw, token } = await this.#accessCodeRequest(deviceId, "POST", payload);
     const syncStatus = await this.#pollAccessCodeSync(deviceId, token);
@@ -322,11 +401,12 @@ export class KwiksetClient {
       name,
       code: String(code),
       enabled: true,
+      schedule: schedule || null,
       createdAt: new Date().toISOString(),
     });
 
     return {
-      added: { slot: index, name, code: String(code) },
+      added: { slot: index, name, code: String(code), schedule: schedule || null },
       raw_response: raw,
       sync_status: syncStatus,
       note:

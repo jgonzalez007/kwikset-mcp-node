@@ -45,8 +45,16 @@ export function listCodes(deviceId) {
 
 /** Picks the lowest unused index in [min, max] among codes THIS SERVER
  * has tracked for this device. See the limitations note above - this
- * cannot see slots used by codes set outside this server. */
-export function nextIndex(deviceId, { min = 1, max = 30 } = {}) {
+ * cannot see slots used by codes set outside this server.
+ *
+ * min defaults to 10, not 1: confirmed on real hardware (a Kwikset Halo
+ * lock) that a manufacturer/factory-default code occupies one of the
+ * low slot numbers, and creating a code in a colliding slot silently
+ * fails (or is rejected by the Kwikset app) even though the create
+ * request itself returns success. Starting automatic allocation higher
+ * avoids that collision; pass an explicit `slot` to target a specific
+ * index (including a low one) if you know it's free. */
+export function nextIndex(deviceId, { min = 10, max = 30 } = {}) {
   const used = new Set(listCodes(deviceId).map((c) => c.index));
   for (let i = min; i <= max; i++) {
     if (!used.has(i)) return i;
