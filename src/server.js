@@ -50,7 +50,10 @@ server.tool(
   "list_locks",
   "List every Kwikset lock on the account, with its current status, " +
     "battery percentage, and the home it belongs to. Call this first to " +
-    "find a lock's device_id before locking/unlocking/checking it.",
+    "find a lock's device_id before locking/unlocking/checking it. When " +
+    "status_may_be_stale is true the lock is offline and status/battery " +
+    "are its last report (see last_updated) - say so rather than " +
+    "presenting them as live.",
   {},
   async () => toResult(await withClient((c) => c.listLocks()))
 );
@@ -58,7 +61,9 @@ server.tool(
 server.tool(
   "get_lock_status",
   "Get the current status (locked/unlocked/jammed), battery level, and " +
-    "model/serial for one lock. Get device_id from list_locks first.",
+    "model/serial for one lock. Get device_id from list_locks first. " +
+    "status_may_be_stale=true means the lock is offline and these values " +
+    "are its last report (see last_updated).",
   { device_id: z.string().describe("A lock's device_id, from list_locks") },
   async ({ device_id }) =>
     toResult(await withClient((c) => c.getLockStatus(device_id)))
@@ -113,9 +118,10 @@ server.tool(
 // format (confirmed by decompiling the real Android app; see the
 // "Known limitations" comment above the access-code section of
 // kwikset-client.js and the comments in access-code-codec.js for the
-// Schedule byte format). Known gaps vs. the real app, all documented
-// there: no live "list codes" read (local tracking only), and no edit
-// (remove + re-add instead).
+// Schedule byte format). The lock assigns slots and reports them back;
+// deletes are limited to those reported slots. Known gaps vs. the real
+// app, all documented there: no live "list codes" read (local tracking
+// only), and no edit (remove + re-add instead).
 // ---------------------------------------------------------------------
 
 server.tool(
@@ -124,6 +130,8 @@ server.tool(
     "Kwikset's API has no endpoint to read codes back from the lock " +
     "itself, so this only shows codes added/removed through this server " +
     "- it will NOT show codes added via the Kwikset app or the keypad. " +
+    "slot_confirmed=true means the lock reported that slot, and only those " +
+    "codes can be removed with remove_access_code. " +
     "Get device_id from list_locks first.",
   { device_id: z.string().describe("A lock's device_id, from list_locks") },
   async ({ device_id }) =>
@@ -185,34 +193,26 @@ server.tool(
     "a date range or weekly schedule. This creates a real, working entry " +
     "credential on a physical door - only call this after the user has " +
     "explicitly asked for a code to be added, and pass confirm=true. " +
-    "Calling with confirm=false (the default) is a no-op. Slot allocation " +
-    "is tracked locally by this server and can collide with a slot " +
-    "already used by a code set outside it (the Kwikset app, the keypad) " +
-    "- check the app for existing codes first, or pass an explicit slot.",
+    "Calling with confirm=false (the default) is a no-op. The lock picks " +
+    "a free slot itself (it never overwrites an existing code) and the " +
+    "result reports which slot it chose. Codes must be 4-8 digits, must " +
+    "not start with 999999, and their first 4 digits must differ from " +
+    "every other code on the lock - this server can only check that " +
+    "against codes it created, so the lock may still reject a clash with " +
+    "a code set in the Kwikset app. Refused if the lock is offline.",
   {
     device_id: z.string().describe("A lock's device_id, from list_locks"),
     name: z.string().describe("A label for this code, e.g. 'Dog walker'"),
     code: z
       .string()
       .describe("The numeric PIN to add, as a string, 4-8 digits (e.g. '482913')"),
-    slot: z
-      .number()
-      .int()
-      .min(0)
-      .max(255)
-      .optional()
-      .describe(
-        "Specific slot/index to use instead of automatic allocation. " +
-          "Omit to let this server pick the lowest slot it isn't already " +
-          "tracking for this device."
-      ),
     schedule: scheduleSchema.optional(),
     confirm: z
       .boolean()
       .default(false)
       .describe("Must be true to actually add the code."),
   },
-  async ({ device_id, name, code, slot, schedule, confirm }) => {
+  async ({ device_id, name, code, schedule, confirm }) => {
     if (!confirm) {
       return toResult({
         error: "confirmation_required",
@@ -223,20 +223,28 @@ server.tool(
       });
     }
     return toResult(
-      await withClient((c) => c.addAccessCode(device_id, { name, code, slot, schedule }))
+      await withClient((c) => c.addAccessCode(device_id, { name, code, schedule }))
     );
   }
 );
 
 server.tool(
   "remove_access_code",
-  "Remove a keypad access code from a lock. Get slot from " +
-    "list_access_codes first (only codes this server created are known " +
-    "- see list_access_codes). This revokes a real entry credential - " +
-    "only call this after an explicit user request, and pass confirm=true.",
+  "Remove a keypad access code from a lock. Only codes this server " +
+    "created whose slot the lock confirmed (slot_confirmed=true in " +
+    "list_access_codes) can be removed; anything else is refused, because " +
+    "a delete sent to the wrong slot erases whatever code lives there. " +
+    "Codes set in the Kwikset app must be removed in the app. This revokes " +
+    "a real entry credential - only call this after an explicit user " +
+    "request, and pass confirm=true. Refused if the lock is offline.",
   {
     device_id: z.string().describe("A lock's device_id, from list_locks"),
-    slot: z.number().int().min(0).max(255).describe("A code's slot, from list_access_codes"),
+    slot: z
+      .number()
+      .int()
+      .min(0)
+      .max(255)
+      .describe("A confirmed slot from list_access_codes"),
     confirm: z
       .boolean()
       .default(false)

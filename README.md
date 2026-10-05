@@ -149,7 +149,7 @@ password.
 | `unlock_door(device_id, confirm)` | Unlock a door (`confirm=true` required) |
 | `debug_raw_devices` | Diagnostic: raw, unprocessed home/device JSON from Kwikset's API |
 | `list_access_codes(device_id)` | Codes this server has created — see below |
-| `add_access_code(device_id, name, code, slot?, confirm)` | Add a code — see below |
+| `add_access_code(device_id, name, code, schedule?, confirm)` | Add a code — see below |
 | `remove_access_code(device_id, slot, confirm)` | Remove a code — see below |
 | `debug_raw_access_codes(device_id)` | Diagnostic: raw CRC/checksum manifest from Kwikset's API |
 
@@ -185,20 +185,31 @@ app — not guesses, but genuine capability limits of this implementation:
   date/time fields are local wall-clock time, not UTC/epoch.
 - **No edit.** The real edit/modify request was never reverse-engineered.
   Remove the old code and add a new one instead.
-- **Slot collisions are possible.** Because there's no live read, slot
-  numbers are tracked locally, with no visibility into slots already used
-  by codes set outside this server. **Confirmed on real hardware:** a
-  manufacturer/factory-default code occupies one of the low slot numbers
-  - colliding with it silently fails (or is rejected by the Kwikset app)
-  even though the create request itself returns success. Automatic
-  allocation now starts at slot 10 to avoid this; check the Kwikset app
-  for existing codes before adding one here, or pass an explicit `slot`.
+- **The lock picks the slot.** Like the real app, `add_access_code`
+  sends slot 0 and the lock stores the code in its lowest free slot,
+  reusing deleted slots and never overwriting an existing code. The lock
+  reports the slot it chose in the sync-status reply (`message: "0301XX"`,
+  slot = `XX` in hex), and that's the slot recorded locally. Verified on a
+  HALO-01: deleting the reported slot removed exactly that code.
+- **Deletes are limited to confirmed slots.** `remove_access_code` only
+  accepts a slot the lock reported for a code this server created. A
+  delete sent to any other slot erases whatever code lives there — that
+  happened during testing — so codes set in the Kwikset app have to be
+  removed in the app.
+- **Code rules.** As in the real app: 4–8 digits, no `999999` prefix, and
+  the first 4 digits must differ from every other code. This server can
+  only check that against codes it created.
+- **Offline locks.** Access-code changes are refused while a lock reports
+  itself disconnected, and lock status carries `status_may_be_stale` /
+  `last_updated` so an offline lock's last report isn't mistaken for live
+  state.
+- **The Kwikset app can lag.** It may keep showing a code deleted
+  elsewhere, and its own delete can fail silently until the app is
+  force-closed, reopened, and refreshed. The keypad is the source of truth.
 
-Concretely: treat your first `add_access_code` call as the real test —
-**verify the result in the Kwikset app or at the keypad afterward.** If
-it fails outright, `debug_raw_access_codes` shows the raw manifest
-response, and the tool's own `raw_response`/`sync_status` fields show
-exactly what Kwikset's API returned for the create/delete call itself.
+Confirm every add and delete at the keypad: a delete's sync-status reply
+carries no confirmation. `raw_response`/`sync_status` in each tool result
+show exactly what Kwikset's API returned.
 
 ## Re-authenticating
 

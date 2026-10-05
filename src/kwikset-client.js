@@ -12,6 +12,9 @@ import {
   buildDateRangeScheduleBytes,
   buildWeeklyScheduleBytes,
   DeviceAccessScheduleType,
+  LOCK_ASSIGNS_SLOT,
+  parseAssignedSlot,
+  checkCodeRules,
 } from "./access-code-codec.js";
 import * as codeStore from "./access-code-store.js";
 
@@ -117,7 +120,16 @@ export class KwiksetClient {
   }
 
   static #summarize(device, home) {
+    const connectivity = first(device, "deviceconnectivitystatus");
+    const updated = Number(first(device, "lastupdatedtimestamp", "lastupdatestatus"));
     return {
+      // A disconnected lock keeps reporting its last known state and
+      // battery, which can be days old - surface that instead of letting
+      // stale values pass as live.
+      connectivity,
+      status_may_be_stale: connectivity !== null && connectivity !== "connected",
+      last_updated:
+        Number.isFinite(updated) && updated > 0 ? new Date(updated * 1000).toISOString() : null,
       device_id: first(device, "deviceid", "deviceId", "id"),
       name: first(device, "devicename", "deviceName", "name"),
       home: home ? first(home, "homename", "homeName", "name") : null,
@@ -209,25 +221,29 @@ export class KwiksetClient {
   // pairing, no secret material involved anywhere in this flow - see
   // access-code-codec.js for the exact byte-level construction.
   //
-  // Known limitations of this implementation (v1):
+  // Slot allocation (verified on a HALO-01, app v2.11.0 decompiled):
+  //   - Creates send index 0 (LOCK_ASSIGNS_SLOT), exactly like the real
+  //     app. The lock takes the lowest free slot, reuses deleted slots,
+  //     and never overwrites an existing code.
+  //   - The sync-status reply after a create carries the assigned slot as
+  //     a hex TLV8 record, "0301XX" (see parseAssignedSlot). A delete for
+  //     slot XX removes exactly that code. The real app ignores this
+  //     reply and learns the slot from its AppSync subscription instead.
+  //
+  // Known limitations:
   //   - There is genuinely no "list codes" endpoint on Kwikset's server -
-  //     only CRC/checksum manifests, meant for the lock to verify sync,
-  //     not to read code contents. list_access_codes can therefore only
-  //     show codes THIS SERVER has created (see access-code-store.js) -
-  //     it cannot see codes added via the Kwikset app or the keypad.
-  //   - Only "always allowed" (no-schedule) codes are supported. Real
-  //     schedule serialization (date ranges, weekly schedules) was never
-  //     decompiled - see SCHEDULE_TYPE_ALL_DAY in access-code-codec.js.
-  //   - Editing an existing code (PATCH) is not implemented - the real
-  //     edit lambda (yr.h0) was never decompiled, so its exact payload
-  //     shape is unconfirmed. Remove + re-add covers the same result.
-  //   - Slot/index allocation is tracked locally starting from 1; it can
-  //     collide with a slot already used by a code set outside this
-  //     server (the app, the keypad). Check the Kwikset app for existing
-  //     codes before relying on automatic slot allocation.
-  //   - The response's sync-status field meanings (SyncStatusResponse)
-  //     were never decompiled, so #pollAccessCodeSync returns the raw
-  //     response rather than pretending to interpret a "done" flag.
+  //     only CRC/checksum manifests, and their per-slot variants return
+  //     OPERATION_NOT_AVAILABLE on a HALO-01. list_access_codes can only
+  //     show codes THIS SERVER has created (see access-code-store.js).
+  //   - Deletes are refused unless the slot was reported by the lock, so a
+  //     delete can't land on a code this server doesn't know about.
+  //   - Code-uniqueness rules can only be checked against codes this
+  //     server knows; the lock or app may still reject a clash with a code
+  //     set elsewhere.
+  //   - Editing an existing code (PATCH) is not implemented. Remove +
+  //     re-add covers the same result.
+  //   - A delete's sync-status reply carries no confirmation (it is "" or
+  //     TOKEN_NOT_FOUND), so removals are returned unverified.
   // ---------------------------------------------------------------------
 
   static #validateCodeValue(code) {
@@ -241,6 +257,14 @@ export class KwiksetClient {
   async #accessCodeRequest(deviceId, method, payloadBuffer) {
     const { device } = await this.#findDevice(deviceId);
     const id = first(device, "deviceid", "deviceId", "id");
+    const connectivity = first(device, "deviceconnectivitystatus");
+    if (connectivity !== null && connectivity !== "connected") {
+      throw new ValidationError(
+        `Lock ${id} reports connectivity "${connectivity}", so the cloud ` +
+          "can't deliver access-code changes to it. Bring it back online " +
+          "(check its Wi-Fi in the Kwikset app) and try again."
+      );
+    }
     const message = payloadBuffer.toString("base64");
     const raw = await this.#apiRequest(`prod_v1/devices/${id}/accesscode`, {
       method,
@@ -252,13 +276,14 @@ export class KwiksetClient {
     return { id, raw, token };
   }
 
-  /** Polls the async sync-status endpoint a few times after a
-   * create/delete. See the "Known limitations" comment above this
-   * section - the response is returned raw rather than interpreted. */
-  async #pollAccessCodeSync(deviceId, token, { attempts = 4, intervalMs = 1500 } = {}) {
+  /** Polls the async sync-status endpoint after a create/delete, stopping
+   * early once `done(response)` is true. Returns the last raw response. */
+  async #pollAccessCodeSync(
+    id,
+    token,
+    { attempts = 4, intervalMs = 1500, done = () => false } = {}
+  ) {
     if (!token) return null;
-    const { device } = await this.#findDevice(deviceId);
-    const id = first(device, "deviceid", "deviceId", "id");
     let last = null;
     for (let i = 0; i < attempts; i++) {
       if (i > 0) await new Promise((resolve) => setTimeout(resolve, intervalMs));
@@ -267,6 +292,7 @@ export class KwiksetClient {
       } catch (err) {
         last = { error: String(err.message || err) };
       }
+      if (done(last)) break;
     }
     return last;
   }
@@ -288,7 +314,8 @@ export class KwiksetClient {
    * live read of the lock's actual state. */
   listAccessCodes(deviceId) {
     return codeStore.listCodes(deviceId).map((entry) => ({
-      slot: entry.index,
+      slot: entry.index ?? null,
+      slot_confirmed: Boolean(entry.slotConfirmed),
       name: entry.name,
       code: entry.code,
       enabled: entry.enabled,
@@ -369,35 +396,39 @@ export class KwiksetClient {
   /** Add a keypad access code. Omit `schedule` for a permanent,
    * always-allowed code, or pass a date_range/weekly schedule (see
    * #resolveSchedule) - both confirmed from decompiling the real app's
-   * Schedule TLV8 byte format. Pass `slot` to target a specific index
-   * instead of automatic allocation. */
-  async addAccessCode(deviceId, { name, code, slot, schedule } = {}) {
+   * Schedule TLV8 byte format. The lock picks the slot and reports it
+   * back; see the slot-allocation comment above this section. */
+  async addAccessCode(deviceId, { name, code, schedule } = {}) {
     if (!name || !String(name).trim()) {
       throw new ValidationError("name is required.");
     }
     KwiksetClient.#validateCodeValue(code);
-
-    const index =
-      slot !== undefined && slot !== null ? Number(slot) : codeStore.nextIndex(deviceId);
-    if (!Number.isInteger(index) || index < 0 || index > 255) {
-      throw new ValidationError(`slot must be an integer 0-255, got ${JSON.stringify(slot)}`);
-    }
+    const ruleError = checkCodeRules(
+      code,
+      codeStore.listCodes(deviceId).map((c) => c.code)
+    );
+    if (ruleError) throw new ValidationError(ruleError);
 
     const { scheduleType, scheduleBytes } = KwiksetClient.#resolveSchedule(schedule);
 
     const payload = buildCreateAccessCodePayload({
-      index,
+      index: LOCK_ASSIGNS_SLOT,
       friendlyName: name,
       enabled: true,
       code,
       scheduleType,
       scheduleBytes,
     });
-    const { raw, token } = await this.#accessCodeRequest(deviceId, "POST", payload);
-    const syncStatus = await this.#pollAccessCodeSync(deviceId, token);
+    const { id, raw, token } = await this.#accessCodeRequest(deviceId, "POST", payload);
+    const syncStatus = await this.#pollAccessCodeSync(id, token, {
+      attempts: 8,
+      done: (res) => parseAssignedSlot(res?.message) !== null,
+    });
+    const assigned = parseAssignedSlot(syncStatus?.message);
 
     codeStore.recordAdd(deviceId, {
-      index,
+      index: assigned,
+      slotConfirmed: assigned !== null,
       name,
       code: String(code),
       enabled: true,
@@ -406,32 +437,47 @@ export class KwiksetClient {
     });
 
     return {
-      added: { slot: index, name, code: String(code), schedule: schedule || null },
+      added: { slot: assigned, name, code: String(code), schedule: schedule || null },
       raw_response: raw,
       sync_status: syncStatus,
       note:
-        "Verify this code works at the keypad or shows up in the Kwikset " +
-        "app - the sync-status response's field meanings aren't fully " +
-        "confirmed yet (see raw_response/sync_status above).",
+        assigned !== null
+          ? `The lock stored this code in slot ${assigned}. Confirm at the keypad.`
+          : "The lock didn't report a slot yet, so this server can't delete " +
+            "this code later - remove it in the Kwikset app if needed. Confirm " +
+            "at the keypad that it works.",
     };
   }
 
-  /** Remove a keypad access code by its slot (from list_access_codes). */
+  /** Remove a keypad access code by its slot. Only slots the lock reported
+   * for a code this server created are accepted. */
   async removeAccessCode(deviceId, slot) {
     const index = Number(slot);
     if (!Number.isInteger(index) || index < 0 || index > 255) {
       throw new ValidationError(`slot must be an integer 0-255, got ${JSON.stringify(slot)}`);
     }
+    const entry = codeStore.findConfirmed(deviceId, index);
+    if (!entry) {
+      throw new ValidationError(
+        `Slot ${index} isn't a lock-confirmed slot for a code this server ` +
+          "created, so deleting it could erase a code set in the Kwikset app " +
+          "or at the keypad. Check list_access_codes, or delete the code in " +
+          "the Kwikset app."
+      );
+    }
     const payload = buildDeleteAccessCodePayload(index);
-    const { raw, token } = await this.#accessCodeRequest(deviceId, "DELETE", payload);
-    const syncStatus = await this.#pollAccessCodeSync(deviceId, token);
+    const { id, raw, token } = await this.#accessCodeRequest(deviceId, "DELETE", payload);
+    const syncStatus = await this.#pollAccessCodeSync(id, token);
 
     codeStore.recordRemove(deviceId, index);
 
     return {
-      removed: { slot: index },
+      removed: { slot: index, name: entry.name },
       raw_response: raw,
       sync_status: syncStatus,
+      note:
+        "Kwikset's reply to a delete carries no confirmation. Check at the " +
+        "keypad that the code no longer works.",
     };
   }
 }

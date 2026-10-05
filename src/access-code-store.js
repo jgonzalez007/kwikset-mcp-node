@@ -2,22 +2,24 @@
 //
 // Kwikset's cloud API has no "list codes" endpoint - confirmed by
 // decompiling DeviceRestInterface: only CRC/checksum manifest endpoints
-// exist (getOverallAccessCodeCrc and friends), meant for the lock to
-// verify sync integrity, not for reading code contents back. The real
-// app instead relies on a local Room-cached database fed by background
-// BLE/cloud sync, which this server has no access to. So list_access_codes
-// can only ever show "what this server knows it set" - NOT a live read of
-// the lock's actual state.
+// exist (getOverallAccessCodeCrc and friends), and on a HALO-01 the
+// per-slot ones return OPERATION_NOT_AVAILABLE. The real app relies on a
+// local Room database fed by BLE/cloud sync, which this server has no
+// access to. So list_access_codes can only ever show "what this server
+// knows it set" - NOT a live read of the lock's actual state.
 //
-// IMPORTANT LIMITATIONS:
-//   - If a code is added/removed some other way (the Kwikset app, the
-//     keypad itself, another copy of this server), this record goes
-//     stale and won't reflect it.
-//   - There's no way to discover which index/slot numbers are already in
-//     use by codes set outside this server, so a new code added here
-//     could collide with (and silently overwrite) one you didn't know
-//     about. Check the Kwikset app for existing codes before relying on
-//     automatic slot allocation, or pass an explicit slot.
+// Slots: new codes are created with index 0 so the lock picks the slot,
+// and the lock reports the slot it chose in the sync-status reply. An
+// entry's `index` is that reported slot (`slotConfirmed: true`), or null
+// if no slot came back. Only confirmed slots may be deleted - a delete
+// sent to a guessed slot can erase a code this server doesn't know about.
+//
+// LIMITATIONS:
+//   - Codes added/removed some other way (the Kwikset app, the keypad,
+//     another copy of this server) are invisible here, and this record
+//     goes stale if one of ours is deleted elsewhere.
+//   - If the lock reports a slot we already have recorded, the old entry
+//     must have been deleted outside this server; it is replaced.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -43,39 +45,24 @@ export function listCodes(deviceId) {
   return load()[deviceId] || [];
 }
 
-/** Picks the lowest unused index in [min, max] among codes THIS SERVER
- * has tracked for this device. See the limitations note above - this
- * cannot see slots used by codes set outside this server.
- *
- * min defaults to 10, not 1: confirmed on real hardware (a Kwikset Halo
- * lock) that a manufacturer/factory-default code occupies one of the
- * low slot numbers, and creating a code in a colliding slot silently
- * fails (or is rejected by the Kwikset app) even though the create
- * request itself returns success. Starting automatic allocation higher
- * avoids that collision; pass an explicit `slot` to target a specific
- * index (including a low one) if you know it's free. */
-export function nextIndex(deviceId, { min = 10, max = 30 } = {}) {
-  const used = new Set(listCodes(deviceId).map((c) => c.index));
-  for (let i = min; i <= max; i++) {
-    if (!used.has(i)) return i;
-  }
-  throw new Error(
-    `No free access-code slot found in the locally-tracked range ${min}-${max}. ` +
-      "This server only tracks codes it created itself - if the lock's real " +
-      "slot range differs, or codes exist that weren't created here, pass an " +
-      "explicit slot to override."
-  );
+/** Returns the entry recorded at a lock-confirmed slot, or undefined. */
+export function findConfirmed(deviceId, index) {
+  return listCodes(deviceId).find((c) => c.slotConfirmed && c.index === index);
 }
 
 export function recordAdd(deviceId, entry) {
   const data = load();
-  data[deviceId] = (data[deviceId] || []).filter((c) => c.index !== entry.index);
+  data[deviceId] = (data[deviceId] || []).filter(
+    (c) => !(entry.slotConfirmed && c.slotConfirmed && c.index === entry.index)
+  );
   data[deviceId].push(entry);
   save(data);
 }
 
 export function recordRemove(deviceId, index) {
   const data = load();
-  data[deviceId] = (data[deviceId] || []).filter((c) => c.index !== index);
+  data[deviceId] = (data[deviceId] || []).filter(
+    (c) => !(c.slotConfirmed && c.index === index)
+  );
   save(data);
 }

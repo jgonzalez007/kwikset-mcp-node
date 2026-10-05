@@ -169,3 +169,54 @@ export function buildDeleteAccessCodePayload(index) {
   }
   return tlv8Record(TxCommand.DeleteDeviceAccess, Buffer.from([index & 0xff]));
 }
+
+/**
+ * Index to send on create when the lock should pick the slot itself. The
+ * real app always sends 0 on the cloud path (C6047na.m7788d forces it) and
+ * lets the lock allocate. Confirmed on a HALO-01: the lock takes the lowest
+ * free slot, reuses deleted slots, and never overwrites an existing code.
+ */
+export const LOCK_ASSIGNS_SLOT = 0;
+
+/**
+ * Extracts the slot the lock assigned from the sync-status `message` that
+ * follows a create, e.g. "030104" -> 4. The message is a hex TLV8 record:
+ * type 0x03, length 0x01, value = the assigned slot. That reading was
+ * verified on a HALO-01 by deleting the reported slot and confirming at the
+ * keypad that exactly that code stopped working. Returns null for anything
+ * else (deletes reply with "" or TOKEN_NOT_FOUND).
+ */
+export function parseAssignedSlot(message) {
+  const match = /^0301([0-9a-f]{2})$/i.exec(String(message ?? "").trim());
+  return match ? parseInt(match[1], 16) : null;
+}
+
+export const RESERVED_CODE_PREFIX = "999999";
+export const UNIQUE_PREFIX_LENGTH = 4;
+
+/**
+ * The real app's validation (AccessCodeLockExtKt.isAccessCodeAllowed):
+ * reject a code equal to an existing one, sharing its first 4 digits with
+ * one, or starting with the reserved prefix 999999. `existingCodes` can
+ * only be the codes this server knows about. Returns an error string, or
+ * null if the code is allowed.
+ */
+export function checkCodeRules(code, existingCodes = []) {
+  const value = String(code);
+  if (value.startsWith(RESERVED_CODE_PREFIX)) {
+    return `Codes starting with ${RESERVED_CODE_PREFIX} are reserved by the lock.`;
+  }
+  const prefix = value.slice(0, UNIQUE_PREFIX_LENGTH);
+  for (const existing of existingCodes.map(String)) {
+    if (existing === value) {
+      return "That code already exists on this lock.";
+    }
+    if (existing.slice(0, UNIQUE_PREFIX_LENGTH) === prefix) {
+      return (
+        `The first ${UNIQUE_PREFIX_LENGTH} digits (${prefix}) match an existing ` +
+        "code; Kwikset requires them to be unique."
+      );
+    }
+  }
+  return null;
+}
